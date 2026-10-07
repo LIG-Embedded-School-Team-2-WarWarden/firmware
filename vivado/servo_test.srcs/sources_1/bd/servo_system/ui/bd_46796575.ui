@@ -1,0 +1,27 @@
+{
+   "ActiveEmotionalView":"Default View",
+   "Default View_ScaleFactor":"1.0",
+   "Default View_TopLeft":"-249,-9",
+   "ExpandedHierarchyInLayout":"",
+   "guistr":"# # String gsaved with Nlview 7.0r4  2019-12-20 bk=1.5203 VDI=41 GEI=36 GUI=JA:10.0 TLS
+#  -string -flagsOSRD
+preplace port DDR -pg 1 -lvl 3 -x 620 -y 150 -defaultsOSRD
+preplace port FIXED_IO -pg 1 -lvl 3 -x 620 -y 170 -defaultsOSRD
+preplace port port-id_servo_uart_rx -pg 1 -lvl 0 -x 0 -y 310 -defaultsOSRD
+preplace port port-id_servo_uart_tx -pg 1 -lvl 3 -x 620 -y 210 -defaultsOSRD
+preplace port port-id_laser_enable -pg 1 -lvl 3 -x 620 -y 90 -defaultsOSRD
+preplace inst processing_system7_0 -pg 1 -lvl 1 -x 170 -y 160 -defaultsOSRD
+preplace inst laser_gpio_gate_0 -pg 1 -lvl 2 -x 470 -y 80 -defaultsOSRD
+preplace netloc laser_gpio_gate_0_laser_enable 1 2 1 NJ 90
+preplace netloc laser_gpio_gate_0_sense 1 1 2 330J 160 600
+preplace netloc processing_system7_0_GPIO_O 1 1 1 320 70n
+preplace netloc processing_system7_0_GPIO_T 1 1 1 340 90n
+preplace netloc processing_system7_0_UART0_TX 1 1 2 NJ 210 NJ
+preplace netloc servo_uart_rx_1 1 0 2 NJ 310 330
+preplace netloc processing_system7_0_DDR 1 1 2 NJ 150 NJ
+preplace netloc processing_system7_0_FIXED_IO 1 1 2 NJ 170 NJ
+levelinfo -pg 1 0 170 470 620
+pagesize -pg 1 -db -bbox -sgen -150 0 770 330
+"
+}
+

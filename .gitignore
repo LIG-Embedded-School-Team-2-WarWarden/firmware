@@ -1,0 +1,11 @@
+
+/vivado/.Xil/
+/vivado/servo_test.cache/
+/vivado/servo_test.runs/
+/vivado/servo_test.sim/
+/vivado/servo_test.gen/
+/vivado/servo_test.hw/
+/vivado/servo_test.ip_user_files/
+/vivado/*.log
+/vivado/*.jou
+/vivado/*.str
