@@ -13,7 +13,6 @@ struct Command {
 };
 
 static Command parseCommand(const std::string& message) {
-    // MOVE 순번 PAN위치 TILT위치 PAN속도 TILT속도
     std::istringstream input(message);
     std::string name;
     Command command{};
@@ -33,7 +32,6 @@ static void waitForPosition(const Command& command, const Peer& peer) {
                       std::to_string(position.panTicks) + " " +
                       std::to_string(position.tiltTicks));
 
-        // 두 축 모두 목표 오차 5틱 이내인 상태가 3번 이어지면 도착이다.
         bool arrived = std::abs(position.panTicks - command.pan) <= 5 &&
                        std::abs(position.tiltTicks - command.tilt) <= 5;
         stable = arrived ? stable + 1 : 0;
@@ -52,18 +50,16 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
     while (true) {
-        // 1. UDP 명령을 받는다.
+        
         Peer peer{};
         Command command = parseCommand(ethernetReceive(peer));
         std::string id = std::to_string(command.sequence);
         ethernetReply(peer, "ACCEPTED " + id);
 
-        // 2. 모터를 움직이고 실제 위치가 목표에 도달할 때까지 기다린다.
         motorMove(command.pan, command.tilt, command.panSpeed, command.tiltSpeed);
         waitForPosition(command, peer);
         ethernetReply(peer, "ARRIVED " + id);
 
-        // 3. 레이저를 1초 켰다가 끄고 완료를 알린다.
         laserOn();
         sleep(1);
         laserOff();
