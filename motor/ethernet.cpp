@@ -1,32 +1,31 @@
 #include "ethernet.h"
 #include <sys/socket.h>
-#include <arpa/inet.h>
+#include <poll.h>
 
 using namespace std;
 static int udp;
 
 void ethernetInit(unsigned short port) {
     udp = socket(AF_INET, SOCK_DGRAM, 0);
-
-    sockaddr_in server{};
-    server.sin_family = AF_INET;
-    server.sin_addr.s_addr = inet_addr("10.0.0.2"); // 노트북 IP
-    server.sin_port = htons(port);               // 노트북 수신 포트
-
-    sendto(udp, "READY", 5, 0,
-           reinterpret_cast<const sockaddr*>(&server), sizeof(server));
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(port);
+    bind(udp, reinterpret_cast<sockaddr*>(&local), sizeof(local));
 }
 
-std::string ethernetReceive(Peer& peer) {
+string ethernetReceive(Peer& peer, int timeoutMs) {
+    pollfd item{udp, POLLIN, 0};
+    if (poll(&item, 1, timeoutMs) <= 0) return {};
     // 명령이 도착할 때까지 기다리고, 송신자의 주소도 함께 저장한다.
     char buffer[128];
     socklen_t length = sizeof(peer.address);
     int size = recvfrom(udp, buffer, sizeof(buffer), 0,
                        reinterpret_cast<sockaddr*>(&peer.address), &length);
-    return string(buffer, size);
+    return size > 0 ? std::string(buffer, size) : std::string();
 }
 
-void ethernetReply(const Peer& peer, const string& message) {
+void ethernetReply(const Peer& peer, const std::string& message) {
     sendto(udp, message.data(), message.size(), 0,
            reinterpret_cast<const sockaddr*>(&peer.address), sizeof(peer.address));
 }
