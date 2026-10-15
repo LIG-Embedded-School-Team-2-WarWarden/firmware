@@ -4,6 +4,6 @@
 #include <netinet/in.h>
 struct Peer { sockaddr_in address; };
 void ethernetInit(unsigned short port);
-std::string ethernetReceive(Peer& peer);
+std::string ethernetReceive(Peer& peer, int timeoutMs = -1);
 void ethernetReply(const Peer& peer, const std::string& message);
 #endif
