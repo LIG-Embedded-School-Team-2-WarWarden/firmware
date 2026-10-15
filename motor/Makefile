@@ -1,7 +1,7 @@
 CXX = arm-linux-gnueabihf-g++
 CPPFLAGS += -D_DEFAULT_SOURCE
 CXXFLAGS ?= -O2 -Wall -Wextra
-CXXFLAGS += -std=c++11
+CXXFLAGS += -std=c++11 -pthread
 OBJECTS = main.o motor.o laser.o ethernet.o
 
 all: motor-demo
