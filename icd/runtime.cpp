@@ -1,4 +1,8 @@
 #include "runtime.hpp"
+#include "acquisition.hpp"
+#include <fstream>
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/util/json_util.h>
 #include "client.hpp"
 #include "motor.hpp"
 #include "capture.hpp"
@@ -19,11 +23,12 @@ struct Options {
     double uncertainty=0;Calibration axes;lidar::Config sensor;
     unsigned point_timeout_ms=2000,stop_timeout_ms=2000,settle_ms=150;
     double tolerance_deg=.5;
+    std::optional<AcquisitionProfile> acquisition;
 };
 static Options options(int argc,char** argv,const std::string& role){
     std::map<std::string,std::string> args;bool simulation=false,clock=false;
     for(int i=1;i<argc;++i){const std::string key=argv[i];if(key=="--simulate"){simulation=true;continue;}if(key=="--clock-verified"){clock=true;continue;}
-        if(key=="--help"){std::cout<<"mfs_obs | mfs_eff --simulate --c2-address IPv4 --c2-port 5000 [--device-id ID] [--listen-port PORT]\nReal Linux: --uart DEVICE --baud N --calibration-id ID --pan-zero N --tilt-zero N --ticks-per-turn N --pan-sign +/-1 --tilt-sign +/-1 --pan-min-ticks N --pan-max-ticks N --tilt-min-ticks N --tilt-max-ticks N --point-timeout-ms N --stop-timeout-ms N --settle-ms N --tolerance-deg N [--clock-verified --clock-uncertainty-ms N]\nReal OBS additionally: --sensor-ip IP --board-ip IP --sensor-profile ID, build with LIDAR_WITH_XTSDK=ON.\n";std::exit(0);}
+        if(key=="--help"){std::cout<<"mfs_obs | mfs_eff --simulate --c2-address IPv4 --c2-port 5000 [--device-id ID] [--listen-port PORT]\nReal Linux: --uart DEVICE --baud N --calibration-id ID --pan-zero N --tilt-zero N --ticks-per-turn N --pan-sign +/-1 --tilt-sign +/-1 --pan-min-ticks N --pan-max-ticks N --tilt-min-ticks N --tilt-max-ticks N --point-timeout-ms N --stop-timeout-ms N --settle-ms N --tolerance-deg N [--clock-verified --clock-uncertainty-ms N]\nReal OBS additionally: --sensor-ip IP --board-ip IP --sensor-profile ID [--acquisition-profile JSON], build with LIDAR_WITH_XTSDK=ON.\n";std::exit(0);}
         if(key.rfind("--",0)!=0 || i+1==argc)throw std::invalid_argument("unknown/incomplete option "+key);args[key]=argv[++i];}
     Options o;o.simulation=simulation;o.clock_verified=simulation||clock;
     auto get=[&](const char* key,const std::string& fallback={}){auto i=args.find(key);return i==args.end()?fallback:i->second;};
@@ -43,6 +48,23 @@ static Options options(int argc,char** argv,const std::string& role){
         o.settle_ms=std::stoul(required("--settle-ms"));o.tolerance_deg=std::stod(required("--tolerance-deg"));
         if(clock)o.uncertainty=std::stod(required("--clock-uncertainty-ms"));
         if(o.role=="obs"){o.sensor.sensor_ip=required("--sensor-ip");o.sensor.board_ip=required("--board-ip");o.profile=required("--sensor-profile");}
+    }
+    if(args.count("--acquisition-profile")){
+        if(simulation||o.role!="obs"||!clock)throw std::invalid_argument("acquisition profile requires real OBS and verified board clock");
+        std::ifstream file(required("--acquisition-profile"));if(!file)throw std::invalid_argument("cannot read acquisition profile");
+        const std::string json((std::istreambuf_iterator<char>(file)),{});google::protobuf::Struct data;
+        if(!google::protobuf::util::JsonStringToMessage(json,&data).ok())throw std::invalid_argument("invalid acquisition JSON");
+        auto text=[&](const char* k){const auto i=data.fields().find(k);if(i==data.fields().end()||i->second.kind_case()!=google::protobuf::Value::kStringValue||i->second.string_value().empty())throw std::invalid_argument(std::string("profile string required: ")+k);return i->second.string_value();};
+        auto number=[&](const char* k){const auto i=data.fields().find(k);if(i==data.fields().end()||i->second.kind_case()!=google::protobuf::Value::kNumberValue||!std::isfinite(i->second.number_value()))throw std::invalid_argument(std::string("profile number required: ")+k);return i->second.number_value();};
+        auto integer=[&](const char* k){const double n=number(k);if(n<0||n>255||n!=std::floor(n))throw std::invalid_argument("profile SDK enum must be uint8");return static_cast<std::uint32_t>(n);};
+        AcquisitionProfile p;p.id=text("id");p.evidence=text("evidence");p.board_boot_id=text("board_boot_id");p.sensor_ip=text("sensor_ip");p.sensor_profile=text("sensor_profile");
+        p.offset_seconds=number("offset_seconds");p.uncertainty_ms=number("uncertainty_ms");p.start_offset_ms=number("start_offset_ms");p.end_offset_ms=number("end_offset_ms");
+        p.valid_from=parse_utc(text("valid_from"));p.valid_until=parse_utc(text("valid_until"));p.max_pose_gap_ms=number("max_pose_gap_ms");
+        p.sync_type=integer("sync_type");p.sync_state=integer("sync_state");p.frame_protocol_version=integer("frame_protocol_version");
+        std::ifstream boot_file("/proc/sys/kernel/random/boot_id");std::string boot;std::getline(boot_file,boot);
+        if(boot.empty()||boot!=p.board_boot_id||p.sensor_ip!=o.sensor.sensor_ip||p.sensor_profile!=o.profile||p.id.size()>64||p.evidence.size()>1024||
+           p.uncertainty_ms<1||p.uncertainty_ms<o.uncertainty||p.uncertainty_ms>100||p.start_offset_ms>0||p.end_offset_ms<0||p.start_offset_ms>=p.end_offset_ms||p.max_pose_gap_ms<=0||p.max_pose_gap_ms>250||p.valid_from>wall()||p.valid_until<=wall())throw std::invalid_argument("profile boot/sensor/time/uncertainty/interval mismatch");
+        o.acquisition=std::move(p);
     }
     if(!std::isfinite(o.uncertainty)||o.uncertainty<0)throw std::invalid_argument("invalid verified clock uncertainty");
     if(!o.point_timeout_ms||o.point_timeout_ms>60000||!o.stop_timeout_ms||o.stop_timeout_ms>60000||!o.settle_ms||!std::isfinite(o.tolerance_deg)||o.tolerance_deg<=0)throw std::invalid_argument("invalid completion profile");
@@ -69,6 +91,10 @@ class Application {
     Mono::time_point last_status_{};
     bool settled_=false;
     Sample previous_sample_,stable_sample_;
+    PoseHistory pose_history_;
+    std::uint64_t pose_generation_=0;
+    std::optional<lidar::Frame> pending_frame_;
+    double last_wall_=wall();Mono::time_point last_mono_=Mono::now();
     Mono::time_point stable_since_{};
     bool stopped()const{return settled_&&!motion_&&motor_.sample().pan_valid&&motor_.sample().tilt_valid;}
     pb::MotionState motion_state()const{
@@ -138,13 +164,13 @@ class Application {
             if(!obs&&p.origin()==pb::CONTROL_MODE_AUTO&&(!p.has_collection_session_id()||!p.has_object_id()||!p.has_source_device_id()||!p.has_source_connection_session_id()||!p.has_source_frame_id()||!p.has_observation_installation_revision())){client_.reject(e,pb::REASON_CODE_INVALID_MESSAGE);return;}
             if(!obs&&p.origin()==pb::CONTROL_MODE_MANUAL&&(p.has_collection_session_id()||p.has_object_id()||p.has_source_frame_id())){client_.reject(e,pb::REASON_CODE_INVALID_MESSAGE);return;}
             if(!motor_.in_range(pan,tilt)){client_.reject(e,pb::REASON_CODE_OUT_OF_RANGE);return;}
-            cancel_motion();high=seq;settled_=false;stable_since_={};
+            cancel_motion();high=seq;settled_=false;stable_since_={};++pose_generation_;pending_frame_.reset();
             if(!motor_.move(pan,tilt)){client_.reject(e,pb::REASON_CODE_OUT_OF_RANGE);return;}
             motion_=Motion{e,pan,tilt,Mono::now(),{},motor_.sample().sequence,false};finish_motion(e,pb::REQUEST_RESULT_ACCEPTED);
             if(!obs){last_point_request_=p.request_id();last_point_epoch_=p.control_epoch();last_point_sequence_=p.command_sequence();}
             std::cout<<"POINT "<<options_.id<<' '<<seq<<' '<<pan<<' '<<tilt<<'\n'<<std::flush;
         }else if(stop){
-            cancel_motion();high=seq;gate_=obs_gate_=false;settled_=false;stable_since_={};
+            cancel_motion();high=seq;gate_=obs_gate_=false;settled_=false;stable_since_={};++pose_generation_;pending_frame_.reset();
             if(!motor_.hold()){client_.reject(e,pb::REASON_CODE_ANGLE_READ_FAILED);return;}
             motion_=Motion{e,motor_.sample().pan,motor_.sample().tilt,Mono::now(),{},motor_.sample().sequence,true};finish_motion(e,pb::REQUEST_RESULT_ACCEPTED);
             std::cout<<"STOP "<<options_.id<<' '<<seq<<'\n'<<std::flush;
@@ -181,6 +207,7 @@ class Application {
             if(q.collection_session_id().size()!=36||(!start&&q.operation()!=pb::MeasurementCommand::OPERATION_STOP)){client_.reject(e,pb::REASON_CODE_INVALID_ARGUMENT);return;}
             if(start&&(!stopped()||!mode_revision_||collecting_)){client_.reject(e,pb::REASON_CODE_BUSY);return;}
             if(!start&&q.collection_session_id()!=collection_){client_.reject(e,pb::REASON_CODE_UNKNOWN_SESSION);return;}
+            pending_frame_.reset();
             if(start)collection_=q.collection_session_id();else collecting_=false;
             measurement_start_=start;measurement_request_=e;
             pb::Envelope out;auto* r=out.mutable_measurement_result();result(r->mutable_outcome(),q.request_id(),pb::REQUEST_RESULT_ACCEPTED);r->set_collection_session_id(q.collection_session_id());r->set_actual_state(start?pb::MEASUREMENT_STATE_STARTING:pb::MEASUREMENT_STATE_STOPPING);client_.send(out,q.request_id());
@@ -188,6 +215,11 @@ class Application {
         }else client_.reject(e,pb::REASON_CODE_UNSUPPORTED_TYPE);
     }
     void progress(){
+        const double current_wall=wall();const auto current_mono=Mono::now();
+        if(std::abs((current_wall-last_wall_)-std::chrono::duration<double>(current_mono-last_mono_).count())>.25){
+            pose_history_.clear();pending_frame_.reset();options_.acquisition.reset();options_.clock_verified=false;
+        }
+        last_wall_=current_wall;last_mono_=current_mono;
         const bool fresh=motor_.poll();
         if(fresh){const auto& s=motor_.sample();const auto now=Mono::now();
             if(s.pan_valid&&s.tilt_valid&&previous_sample_.pan_valid&&previous_sample_.tilt_valid&&s.pan_at-previous_sample_.pan_at<=.25&&s.tilt_at-previous_sample_.tilt_at<=.25&&std::abs(s.pan-previous_sample_.pan)<=options_.tolerance_deg&&std::abs(s.tilt-previous_sample_.tilt)<=options_.tolerance_deg){
@@ -208,6 +240,7 @@ class Application {
                 if(settled_&&now-motion_->near_since>=std::chrono::milliseconds(options_.settle_ms)){auto q=motion_->request;motion_.reset();finish_motion(q,pb::REQUEST_RESULT_COMPLETED);status();}
             }else motion_->near_since={};
         }
+        if(fresh){const auto& s=motor_.sample();pose_history_.add({wall(),s.pan_at,s.tilt_at,s.pan,s.tilt,s.pan_valid&&s.tilt_valid,stopped(),pose_generation_});}
         if(drain_&&!motion_){auto q=*drain_;drain_.reset();finish_motion(q,pb::REQUEST_RESULT_COMPLETED);}
         if(measurement_.valid()&&measurement_.wait_for(std::chrono::milliseconds(0))==std::future_status::ready){
             bool ok=false;try{ok=measurement_.get();}catch(const std::exception&){ok=false;}
@@ -223,15 +256,13 @@ class Application {
     std::size_t packet_size(pb::Envelope e)const{
         e.set_version_major(1);e.set_sender_id(options_.id);e.set_recipient_id("C2");e.set_connection_session_id(client_.session());e.set_message_id(std::string(36,'0'));e.set_sent_at(utc());return e.ByteSizeLong();
     }
-    void raw_frame(lidar::Frame f){
+    void raw_frame(lidar::Frame f,const CapturedPose& captured){
         const auto count=std::uint64_t(f.width)*f.height;if(!count||count>500000||count!=f.points.size())throw std::runtime_error("invalid SDK frame slot count");
         const auto collection=collection_;const auto session=client_.session();const auto pose_id=uuid();++frame_;
         pb::Envelope pose;auto* p=pose.mutable_obs_pose();p->set_obs_id(options_.id);p->set_pose_id(pose_id);p->set_collection_session_id(collection);p->set_installation_revision(installation_);p->set_observation_mode_revision(mode_revision_);p->set_motion_state(motion_state());
-        // Synthetic frames have a known stationary simulated plant. Real SDK data
-        // remain unqualified until acquisition UTC/pose evidence is supplied.
-        const bool measured=options_.simulation&&f.captured_at&&stopped();p->set_pose_valid(measured);
+        const bool measured=captured.quality==PoseQuality::Verified;p->set_pose_valid(measured);
         if(f.captured_at)p->set_captured_at(utc(*f.captured_at));
-        if(measured){p->set_pan_measured(true);p->set_tilt_measured(true);p->set_pan_deg(motor_.sample().pan);p->set_tilt_deg(motor_.sample().tilt);}
+        if(measured){p->set_pan_measured(true);p->set_tilt_measured(true);p->set_pan_deg(captured.pan);p->set_tilt_deg(captured.tilt);}
         client_.send(pose);
         pb::PointCloudChunk meta;meta.set_collection_session_id(collection);meta.set_frame_id(frame_);meta.set_source_frame_id(f.source_id);meta.set_installation_revision(installation_);meta.set_observation_mode_revision(mode_revision_);meta.set_pose_id(pose_id);meta.set_width(f.width);meta.set_height(f.height);meta.set_total_points(static_cast<std::uint32_t>(count));meta.set_sensor_data_profile_id(options_.profile);meta.set_motion_compensation(pb::PointCloudChunk::MOTION_COMPENSATION_NONE);
         if(f.captured_start)meta.set_captured_start_at(utc(*f.captured_start));if(f.captured_at)meta.set_captured_at(utc(*f.captured_at));if(f.captured_end)meta.set_captured_end_at(utc(*f.captured_end));
@@ -252,7 +283,7 @@ public:
         motor_.poll();
         client_.command=[this](const auto& e){command(e);};
         client_.connected=[this](bool changed){if(changed){installation_=mode_revision_=0;control_.clear();obs_control_.clear();epoch_=sequence_=obs_epoch_=obs_sequence_=frame_=0;}capabilities();status();std::cout<<"REGISTERED "<<options_.id<<" boot="<<client_.boot<<" session="<<client_.session()<<'\n'<<std::flush;};
-        client_.disconnected=[this]{motor_.hold();settled_=false;stable_since_={};motion_.reset();drain_.reset();gate_=obs_gate_=false;collecting_=false;measurement_request_.reset();disconnect_stop_=bool(sensor_);};
+        client_.disconnected=[this]{++pose_generation_;pose_history_.clear();pending_frame_.reset();motor_.hold();settled_=false;stable_since_={};motion_.reset();drain_.reset();gate_=obs_gate_=false;collecting_=false;measurement_request_.reset();disconnect_stop_=bool(sensor_);};
     }
     ~Application(){shutdown();}
     void shutdown()noexcept{
@@ -262,7 +293,17 @@ public:
     void run(){
         while(running){client_.step();progress();if(client_.ready()){
             if(Mono::now()-last_status_>=std::chrono::milliseconds(500)){last_status_=Mono::now();status();}
-            if(sensor_&&collecting_){if(auto f=sensor_->latest())raw_frame(std::move(*f));}
+            if(sensor_&&collecting_){
+                if(auto f=sensor_->latest()){
+                    if(options_.acquisition)map_acquisition(*f,*options_.acquisition,wall());
+                    pending_frame_=std::move(*f);
+                }
+                if(pending_frame_){
+                    const double gap=options_.acquisition?options_.acquisition->max_pose_gap_ms:200;
+                    const auto captured=pose_history_.qualify(*pending_frame_,wall(),gap,options_.tolerance_deg,pose_generation_);
+                    if(captured.quality!=PoseQuality::Pending){auto f=std::move(*pending_frame_);pending_frame_.reset();raw_frame(std::move(f),captured);}
+                }
+            }
         }}
         shutdown();
     }

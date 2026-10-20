@@ -9,6 +9,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - run: sh -n scripts/board-preflight.sh && sh scripts/board-preflight.sh --help
       - run: sudo apt-get update
       - run: sudo apt-get install -y cmake g++ libprotobuf-dev protobuf-compiler
       - run: cmake -S . -B build -DLIDAR_WITH_XTSDK=OFF

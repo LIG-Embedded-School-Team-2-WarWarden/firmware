@@ -79,11 +79,88 @@ class EndToEnd(unittest.TestCase):
         self.assertNotEqual(old,self.engine.peers['101']['collection'])
         self.assertEqual(sum(line.startswith('POINT ') for line in self.eff.lines),count)
         self.assertFalse([e for e in self.engine.events if e['event']=='runtime_error'])
+    def test_console_observer_move_stops_aim_then_restarts_collection(self):
+        self.aim()
+        old=self.engine.peers['101']['collection']
+        self.engine.obs_point(20,10)
+        wait(lambda:self.engine.snapshot()['observer_action']['state']=='COMPLETED')
+        wait(lambda:self.engine.snapshot()['observation']=='DISPLAY_ONLY')
+        snapshot=self.engine.snapshot()
+        self.assertEqual(snapshot['controls']['201']['state'],'STOPPED')
+        self.assertNotEqual(old,self.engine.peers['101']['collection'])
+        self.assertAlmostEqual(snapshot['devices']['101']['pan'],20)
+        with self.assertRaises(ValueError):self.engine.aim('201')
+        self.engine.obs_point(0,0)
+        wait(lambda:self.engine.snapshot()['observer_action']['state']=='COMPLETED')
+        wait(lambda:self.engine.snapshot()['observation']=='CURRENT')
+        self.engine.obs_stop()
+        wait(lambda:self.engine.snapshot()['observer_action']['state']=='COMPLETED')
+        self.assertFalse(self.engine.snapshot()['devices']['101']['collecting'])
+        # STOP closes the OBS gate; the next CLI move must open a new epoch/mode.
+        self.engine.obs_point(0,0)
+        wait(lambda:self.engine.snapshot()['observer_action']['state']=='COMPLETED')
+        wait(lambda:self.engine.snapshot()['observation']=='CURRENT')
+
+    def test_observer_stop_cancels_pending_move_without_restarting_collection(self):
+        self.engine.obs_point(20,10)
+        wait(lambda:self.engine.snapshot()['observer_action']['state']=='MOVING')
+        self.engine.obs_stop()
+        wait(lambda:self.engine.snapshot()['observer_action']['state']=='COMPLETED')
+        self.assertFalse(self.engine.snapshot()['devices']['101']['collecting'])
+        count=sum(line.startswith('POINT ') for line in self.obs.lines)
+        time.sleep(.35)
+        self.assertEqual(sum(line.startswith('POINT ') for line in self.obs.lines),count)
+        self.assertFalse(self.engine.snapshot()['devices']['101']['collecting'])
+
     def test_observer_process_loss_stops_effector(self):
         self.aim();self.obs.close()
         wait(lambda:self.engine.snapshot()['controls']['201']['state']=='STOPPED')
         count=sum(line.startswith('POINT ') for line in self.eff.lines);time.sleep(.3)
         self.assertEqual(sum(line.startswith('POINT ') for line in self.eff.lines),count)
+
+class ConsoleProcess(unittest.TestCase):
+    def test_actual_cli_prompt_observer_aim_and_stop(self):
+        reserve=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1];reserve.close()
+        console=subprocess.Popen([sys.executable,str(args.c2_root/'scripts/run_team_mvp.py'),'--asset-port',str(port),'--detector',str(args.detector)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8')
+        lines=queue.Queue()
+        def read():
+            for line in console.stdout:lines.put(line.strip())
+        reader=threading.Thread(target=read,daemon=True);reader.start()
+        def close():
+            if console.poll() is None:
+                try:console.stdin.write('quit\n');console.stdin.flush();console.wait(timeout=5)
+                except (OSError,subprocess.TimeoutExpired):console.terminate();console.wait(timeout=5)
+            reader.join(timeout=1);console.stdin.close();console.stdout.close()
+        obs=eff=None
+        try:
+            self.assertIn('Team ICD',lines.get(timeout=5))
+            obs=Native('obs',port);eff=Native('eff',port)
+            def command(value):
+                console.stdin.write(value+'\n');console.stdin.flush()
+                return lines.get(timeout=5).removeprefix('c2> ')
+            def status(predicate):
+                latest={}
+                def check():
+                    nonlocal latest
+                    latest=json.loads(command('status'))
+                    self.assertIsNone(console.poll())
+                    return predicate(latest)
+                wait(check,8);return latest
+            status(lambda s:s['devices'].get('201',{}).get('installed') and s['observation']=='CURRENT')
+            self.assertIn('OBS:',command('obs point 10 5'))
+            status(lambda s:s['observer_action']['state']=='COMPLETED')
+            report=json.loads(command('obs status'));self.assertAlmostEqual(report['device']['pan'],10)
+            command('obs point 0 0')
+            status(lambda s:s['observer_action']['state']=='COMPLETED' and s['observation']=='CURRENT')
+            self.assertIn('OPENING',command('aim 201'))
+            status(lambda s:s['controls'].get('201',{}).get('sequence',0)>=2)
+            command('stop 201');status(lambda s:s['controls']['201']['state']=='STOPPED')
+            command('obs stop');status(lambda s:s['observer_action']['state']=='COMPLETED' and not s['devices']['101']['collecting'])
+            command('quit');console.wait(timeout=5);self.assertEqual(console.returncode,0)
+        finally:
+            close()
+            if obs:obs.close()
+            if eff:eff.close()
 
 class WirePeer:
     def __init__(self,role,uart=None):
