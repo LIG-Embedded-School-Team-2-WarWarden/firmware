@@ -112,6 +112,21 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(sum(line.startswith('POINT ') for line in self.obs.lines),count)
         self.assertFalse(self.engine.snapshot()['devices']['101']['collecting'])
 
+    def test_observer_unconfirmed_point_sends_stop_without_collect_restart(self):
+        self.engine.obs_point(20,10)
+        def expire():
+            with self.engine.lock:
+                for pending in self.engine.pending.values():
+                    if pending['kind']=='obs_motion_result' and pending['body'].operation==pb.ObsMotionCommand.OPERATION_POINT:
+                        pending['timeout']=.001
+                        return True
+            return False
+        wait(expire)
+        wait(lambda:self.engine.snapshot()['observer_action']['state']=='FAILED')
+        self.assertEqual(self.engine.snapshot()['observer_action']['reason'],'OBS_MOTION_UNCONFIRMED')
+        self.assertFalse(self.engine.snapshot()['devices']['101']['collecting'])
+        self.assertTrue(any(line.startswith('STOP 101 ') for line in self.obs.lines))
+
     def test_observer_process_loss_stops_effector(self):
         self.aim();self.obs.close()
         wait(lambda:self.engine.snapshot()['controls']['201']['state']=='STOPPED')
