@@ -9,3 +9,5 @@
 /vivado/*.log
 /vivado/*.jou
 /vivado/*.str
+/build/
+__pycache__/
