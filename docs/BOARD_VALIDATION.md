@@ -13,9 +13,12 @@
 | UART 패킷·실측 응답 | Linux PTY와 실제 motor.cpp | 쓰기 바이트·체크섬·분할/역순·불량/미응답 검증. 전기적 연결과 실모터 검증은 아님 |
 | 실제 UART runtime | Linux PTY 모터 제어 보드 + mfs_eff + ICD 상대 | 이동·실측 완료·STOP, 피드백 소실 시 FAILED 확인 |
 | SDK adapter | 실제 adapter 소스 + SDK fixture, 공식 헤더 컴파일 | 제조사 바이너리와 실센서 실행은 미검증 |
-| ARM | UART 및 adapter의 arm-linux-gnueabihf object 컴파일 | 전체 PetaLinux 링크·ABI·보드 부팅 검증은 아님 |
+| ARM | EFF 전체 Ubuntu ARMHF 링크 및 UART/SDK adapter object 컴파일 | PetaLinux sysroot 링크·ABI·보드 부팅 검증은 아님 |
 
 시험의 최종 통과 여부와 로그는 해당 PR의 CI checks에서 확인합니다.
+C2 저장소는 비공개이므로 전체 C2↔장치 연동은 C2 저장소의 `Native device integration` workflow에서
+실행합니다. 공개 firmware workflow에는 비공개 소스를 복사하거나 사용자 토큰을 저장하지 않습니다.
+firmware workflow 자체에서는 UART/SDK 계약·독립 빌드·EFF ARMHF 링크를 실행합니다.
 Windows에서는 Linux PTY 시험을 skip하며 합성 UDP 경로를 실행합니다.
 
 ## 실제 보드에서 아직 필요한 조건
@@ -23,7 +26,7 @@ Windows에서는 Linux PTY 시험을 skip하며 합성 UDP 경로를 실행합�
 1. 저장소 `vivado/servo_test.xpr`의 칩은 `xc7z010clg400-1`이고 기존 Makefile은
    `arm-linux-gnueabihf-g++`를 씁니다. 실제 이미지의 `uname -m`, `getconf LONG_BIT`와 대조합니다.
 2. 해당 PetaLinux sysroot에 맞는 C++17 toolchain, ARM Protobuf 라이브러리, 호스트용 protoc가 필요합니다.
-   현재 전체 ARM 실행 파일을 링크하거나 보드에서 실행한 결과는 없습니다.
+   CI는 Ubuntu ARMHF용 EFF 전체 링크를 확인합니다. PetaLinux sysroot용 전체 링크나 보드 실행을 대신하지 않습니다.
 3. 확인한 [공식 SDK 커밋](https://github.com/XT-Toffuture/xtsdk_cpp/tree/3d3db067ae9bdc0528202c3087bc10fd3b706638/xtsdk/lib/linux)은
    x86_64/aarch64 제조사 바이너리만 제공합니다. **32비트 Zynq용 제조사 바이너리를 별도 확보해야 합니다.**
    ARM64 `.so`를 ARM32 보드에서 사용할 수 없습니다. 별도 공급본이 있다면 그 버전·ABI를 대조합니다.
