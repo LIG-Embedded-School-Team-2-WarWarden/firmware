@@ -88,7 +88,8 @@ static void enqueue(Controller& controller, bool stop, int pan, int tilt) {
 static void positionLoop() {
     unsigned long generation = 0, sampleNumber = 0;
     MotorPosition initial = motorReadPositions();
-    motorMove(initial.panTicks, initial.tiltTicks, 200, 200);
+    if(initial.panValid && initial.tiltValid)
+        motorMove(initial.panTicks, initial.tiltTicks, 200, 200);
 
     while (true) {
         MotorJob job{};
@@ -104,7 +105,8 @@ static void positionLoop() {
         if (hasJob) {
             if (job.stop) {
                 MotorPosition position = motorReadPositions();
-                motorMove(position.panTicks, position.tiltTicks, 200, 200);
+                if(position.panValid && position.tiltValid)
+                    motorMove(position.panTicks, position.tiltTicks, 200, 200);
             } else {
                 motorMove(job.pan, job.tilt, 200, 200);
             }
@@ -142,6 +144,7 @@ static bool processLatestSample(Controller& controller, Sample& sample) {
     controller.lastSample = sample.number;
 
     if (sample.generation == controller.generation &&
+        sample.position.panValid && sample.position.tiltValid &&
         nowMs() - sample.time <= ControlFsm::SAMPLE_GAP_MS) {
         controller.fsm.sample(sample.position.panTicks,
                               sample.position.tiltTicks, sample.time);
@@ -246,7 +249,7 @@ static void publishUpdates(const Controller& controller, State before,
     if (before != controller.fsm.state)
         publish(controller, string("STATE ") + controller.fsm.name());
 
-    if (fresh) {
+    if (fresh && sample.position.panValid && sample.position.tiltValid) {
         publish(controller, "POS " + to_string(controller.sequence) + " " +
                 to_string(sample.position.panTicks) + " " +
                 to_string(sample.position.tiltTicks) + " " +
@@ -255,10 +258,11 @@ static void publishUpdates(const Controller& controller, State before,
 }
 
 int main(int argc, char** argv) {
+    if(argc<3 || argc>4) { fprintf(stderr,"Usage: motor-demo UART GPIOCHIP [PORT]\n"); return 1; }
     const unsigned int line = 0, baud = 115200;
     unsigned short port = argc > 3 ? atoi(argv[3]) : 5001;
     laserInit(argv[2], line);
-    motorInit(argv[1], baud);
+    if(!motorInit(argv[1], baud)) { fprintf(stderr,"Motor UART initialization failed\n"); return 2; }
     ethernetInit(port);
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
