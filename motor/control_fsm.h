@@ -2,7 +2,7 @@
 #define CONTROL_FSM_H
 #include <cstdlib>
 
-enum class State { IDLE, AIMING, READY, SHOOT, STOP };
+enum class State { IDLE, AIMING, READY, SHOOT, STOP, FAIL };
 
 // 순수 상태 전이: 실제 UART/GPIO/UDP 호출은 main.cpp가 담당한다.
 struct ControlFsm {
@@ -21,6 +21,7 @@ struct ControlFsm {
         case State::READY: return "READY";
         case State::SHOOT: return "SHOOT";
         case State::STOP: return "STOP";
+        case State::FAIL: return "FAIL";
         }
         return "IDLE";
     }
@@ -49,6 +50,10 @@ struct ControlFsm {
     }
     void off() {
         if (state == State::SHOOT) state = State::IDLE;
+    }
+    void fail(){
+        state=State::FAIL;
+        nearSince=lastSample=-1;
     }
     void stop() { state = State::STOP; nearSince = lastSample = -1; }
     void tick(long long now) {
