@@ -12,9 +12,14 @@ jobs:
       - run: sh -n scripts/board-preflight.sh && sh scripts/board-preflight.sh --help
       - run: sudo apt-get update
       - run: sudo apt-get install -y cmake g++ libprotobuf-dev protobuf-compiler
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install protobuf==6.33.5
       - run: cmake -S . -B build -DLIDAR_WITH_XTSDK=OFF
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure --output-log build/ctest-results.txt
+      - run: python tests/test_laser.py --eff build/mfs_eff --obs build/mfs_obs
       - run: cmake -S . -B build/eff-only -DBUILD_OBS=OFF -DBUILD_TESTING=OFF
       - run: cmake --build build/eff-only --target mfs_eff --parallel 2
       - uses: actions/upload-artifact@v4

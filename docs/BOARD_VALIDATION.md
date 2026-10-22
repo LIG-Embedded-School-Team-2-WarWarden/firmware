@@ -90,7 +90,9 @@ python scripts/run_team_mvp.py --config configs/board.json --bind 0.0.0.0 --asse
 
 네트워크 Heartbeat가 2초 끊기면 새 명령 gate를 닫고 측정한 현재 위치 hold를 시도합니다.
 다만 UART 단절·프로세스 강제종료·전원 소실에서 소프트웨어가 물리 정지를 보장하지는 않습니다.
-STOP은 모터 전원 차단이 아니라 측정 위치 hold이며 레이저 점등/출력 제어는 추가하지 않았습니다.
+STOP은 모터 전원 차단이 아니라 측정 위치 hold이며, 레이저가 설정된 EFF에서는 출력 소등도 요청합니다.
+레이저는 README의 GPIO 출력/비상입력 옵션이 필요합니다. line readback은 광출력 측정이 아니며,
+실물 배선·광출력·비상입력·전원/프로세스 강제 종료 시 기본 OFF 유지 여부를 보드에서 확인해야 합니다.
 
 ## 추가된 CLI와 취득 프로파일
 

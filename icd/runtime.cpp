@@ -4,6 +4,7 @@
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
 #include "client.hpp"
+#include "laser.hpp"
 #include "motor.hpp"
 #include "capture.hpp"
 #include <algorithm>
@@ -24,6 +25,8 @@ struct Options {
     unsigned point_timeout_ms=2000,stop_timeout_ms=2000,settle_ms=150;
     double tolerance_deg=.5;
     std::optional<AcquisitionProfile> acquisition;
+    std::string laser_chip;
+    unsigned laser_line=0,laser_estop_line=0;
 };
 static Options options(int argc,char** argv,const std::string& role){
     std::map<std::string,std::string> args;bool simulation=false,clock=false;
@@ -34,6 +37,17 @@ static Options options(int argc,char** argv,const std::string& role){
     auto get=[&](const char* key,const std::string& fallback={}){auto i=args.find(key);return i==args.end()?fallback:i->second;};
     auto required=[&](const char* key){const auto value=get(key);if(value.empty())throw std::invalid_argument(std::string("real device requires ")+key);return value;};
     o.role=role;if(args.count("--role"))throw std::invalid_argument("role is fixed by executable; use mfs_obs or mfs_eff");
+    if(args.count("--laser-gpiochip") || args.count("--laser-line") || args.count("--laser-estop-line")){
+        if(role!="eff" || simulation || !args.count("--laser-gpiochip") || !args.count("--laser-line") || !args.count("--laser-estop-line"))
+            throw std::invalid_argument("laser GPIO requires real EFF, --laser-gpiochip, --laser-line and --laser-estop-line");
+        o.laser_chip=required("--laser-gpiochip");
+        const auto value=required("--laser-line");size_t end=0;const auto line=std::stoul(value,&end);
+        if(end!=value.size()||line>65535)throw std::invalid_argument("invalid laser GPIO line");
+        o.laser_line=static_cast<unsigned>(line);
+        const auto estop=required("--laser-estop-line");end=0;const auto stop=std::stoul(estop,&end);
+        if(end!=estop.size()||stop>65535||stop==line)throw std::invalid_argument("invalid emergency stop GPIO line");
+        o.laser_estop_line=static_cast<unsigned>(stop);
+    }
     o.id=get("--device-id",o.role=="obs"?"101":"201");o.c2=get("--c2-address","127.0.0.1");
     const auto c2port=std::stoul(get("--c2-port","5000")),port=std::stoul(get("--listen-port","0"));
     if(c2port<1||c2port>65535||port>65535)throw std::invalid_argument("UDP port out of range");o.c2_port=static_cast<unsigned short>(c2port);o.port=static_cast<unsigned short>(port);
@@ -72,7 +86,11 @@ static Options options(int argc,char** argv,const std::string& role){
 }
 
 class Application {
-    Options options_;Motor motor_;std::unique_ptr<lidar::Capture> sensor_;Client client_;
+    Options options_;Motor motor_;std::unique_ptr<lidar::Capture> sensor_;LaserOutput laser_;Client client_;
+    std::uint64_t laser_sequence_=0;
+    std::optional<Mono::time_point> laser_deadline_;
+    std::string laser_request_;
+    pb::LaserState laser_state_=pb::LASER_STATE_UNKNOWN;
     std::uint32_t installation_=0,mode_revision_=0;
     std::string control_,obs_control_,collection_;
     std::uint64_t epoch_=0,sequence_=0,obs_epoch_=0,obs_sequence_=0,frame_=0;
@@ -104,20 +122,70 @@ class Application {
     void capabilities(){
         pb::Envelope e;auto* c=e.mutable_capability_report();c->set_device_id(options_.id);c->set_absolute_pointing(true);c->set_measured_angle_feedback(true);c->set_stop_supported(true);c->set_drain_supported(true);
         c->set_point_completion_timeout_ms(options_.point_timeout_ms);c->set_stop_completion_timeout_ms(options_.stop_timeout_ms);const auto& a=motor_.calibration();
+        c->set_laser_control_supported(laser_.supported());
         c->set_pan_min_deg(std::min(a.degrees(a.pan_min,true),a.degrees(a.pan_max,true)));c->set_pan_max_deg(std::max(a.degrees(a.pan_min,true),a.degrees(a.pan_max,true)));
         c->set_tilt_min_deg(std::min(a.degrees(a.tilt_min,false),a.degrees(a.tilt_max,false)));c->set_tilt_max_deg(std::max(a.degrees(a.tilt_min,false),a.degrees(a.tilt_max,false)));c->set_calibration_id(a.id);
         if(sensor_){c->add_supported_observation_modes(pb::OBSERVATION_MODE_FIXED_VIEW);c->set_pose_feedback_supported(true);c->set_lidar_measurement_stop_supported(true);c->set_sensor_data_profile_id(options_.profile);c->set_organized_frame_supported(true);}
         client_.send(e);
+        laser_status();
+    }
+    void laser_status(){
+        if(!laser_.supported()||!client_.ready())return;
+        laser_state_=laser_.read();
+        pb::Envelope e;auto* s=e.mutable_laser_status();s->set_device_id(options_.id);
+        if(!control_.empty())s->set_control_session_id(control_);
+        s->set_control_epoch(epoch_);s->set_last_accepted_sequence(laser_sequence_);
+        s->set_laser_state(laser_state_);s->set_reported_at(utc());
+        if(laser_state_!=pb::LASER_STATE_UNKNOWN)s->set_state_observed_at(utc());
+        if(laser_state_==pb::LASER_STATE_UNKNOWN || (laser_state_==pb::LASER_STATE_ON&&!laser_deadline_))s->set_fault_code(pb::REASON_CODE_INTERNAL_ERROR);
+        if(laser_state_==pb::LASER_STATE_ON&&laser_deadline_){
+            s->set_active_request_id(laser_request_);
+            const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(*laser_deadline_-Mono::now()).count();
+            s->set_remaining_duration_ms(static_cast<unsigned>(std::max<std::int64_t>(0,remaining)));
+        }
+        client_.send(e);
+    }
+    void laser_off(){
+        if(!laser_.supported())return;
+        laser_.set(false);laser_deadline_.reset();laser_request_.clear();laser_status();
+    }
+    void laser_command(const pb::Envelope& e){
+        const auto& q=e.laser_command();
+        if(options_.role!="eff"||!laser_.supported()){client_.reject(e,pb::REASON_CODE_UNSUPPORTED_TYPE);return;}
+        if(control_.empty()||q.control_session_id()!=control_||q.control_epoch()!=epoch_||!q.command_sequence()||q.command_sequence()<=laser_sequence_){client_.reject(e,pb::REASON_CODE_STALE_COMMAND);return;}
+        if(!installation_||q.effector_installation_revision()!=installation_){client_.reject(e,pb::REASON_CODE_INSTALLATION_MISMATCH);return;}
+        const bool on=q.operation()==pb::LaserCommand::OPERATION_ON,off=q.operation()==pb::LaserCommand::OPERATION_OFF,get=q.operation()==pb::LaserCommand::OPERATION_GET_STATUS;
+        if((!on&&!off&&!get)||(on&&(!q.has_duration_ms()||!q.duration_ms()||!q.has_expires_at()))||(!on&&q.has_duration_ms())){client_.reject(e,pb::REASON_CODE_INVALID_ARGUMENT);return;}
+        if(on&&q.duration_ms()>5000){client_.reject(e,pb::REASON_CODE_OUT_OF_RANGE);return;}
+        if(on&&!options_.clock_verified){client_.reject(e,pb::REASON_CODE_CLOCK_UNTRUSTED);return;}
+        if(on&&laser_.estop_latched()){client_.reject(e,pb::REASON_CODE_ESTOP_LATCHED);return;}
+        try {
+            const double issued=parse_utc(q.issued_at());
+            if((on&&issued>wall()+.1)||(q.has_expires_at()&&parse_utc(q.expires_at())<=wall())){client_.reject(e,pb::REASON_CODE_EXPIRED_COMMAND);return;}
+        }catch(const std::exception&){client_.reject(e,pb::REASON_CODE_INVALID_ARGUMENT);return;}
+        if(on&&(!gate_||drain_||!stopped()||laser_deadline_||laser_.read()!=pb::LASER_STATE_OFF)){client_.reject(e,pb::REASON_CODE_BUSY);return;}
+        laser_sequence_=q.command_sequence();
+        bool ok=true;
+        if(on){
+            ok=laser_.set(true);
+            if(ok){laser_deadline_=Mono::now()+std::chrono::milliseconds(q.duration_ms());laser_request_=q.request_id();}
+            else laser_off();
+        }else if(off){laser_off();ok=laser_.read()==pb::LASER_STATE_OFF;}
+        const auto state=laser_.read();
+        pb::Envelope reply;auto* r=reply.mutable_laser_result();r->set_control_session_id(control_);r->set_control_epoch(epoch_);r->set_command_sequence(q.command_sequence());r->set_actual_laser_state(state);
+        if(state!=pb::LASER_STATE_UNKNOWN)r->set_state_observed_at(utc());
+        result(r->mutable_outcome(),q.request_id(),ok?pb::REQUEST_RESULT_COMPLETED:pb::REQUEST_RESULT_FAILED,ok?pb::REASON_CODE_UNSPECIFIED:pb::REASON_CODE_INTERNAL_ERROR);
+        client_.send(reply,q.request_id());laser_status();
     }
     void status(){
         if(!client_.ready())return;
         pb::Envelope e;auto* s=e.mutable_device_status();s->set_device_id(options_.id);s->set_reported_at(utc());fill_angles(s->mutable_angles(),motor_.sample());
         s->set_device_state(motion_state()==pb::MOTION_STATE_UNKNOWN?pb::DEVICE_STATE_FAULT:motion_?pb::DEVICE_STATE_BUSY:pb::DEVICE_STATE_IDLE);
-        s->set_motion_state(motion_state());s->set_active_installation_revision(installation_);s->set_estop_latch_state(pb::EMERGENCY_LATCH_STATE_RELEASED);
+        s->set_motion_state(motion_state());s->set_active_installation_revision(installation_);s->set_estop_latch_state(laser_.estop_latched()?pb::EMERGENCY_LATCH_STATE_LATCHED:pb::EMERGENCY_LATCH_STATE_RELEASED);
         s->set_clock_state(options_.clock_verified?pb::CLOCK_STATE_SYNCED:pb::CLOCK_STATE_UNKNOWN);if(options_.clock_verified)s->set_clock_uncertainty_ms(options_.uncertainty);
         if(motion_state()==pb::MOTION_STATE_UNKNOWN)s->set_fault_code(pb::REASON_CODE_ANGLE_READ_FAILED);
         if(sensor_)s->set_measurement_state(measurement_.valid()?(measurement_start_?pb::MEASUREMENT_STATE_STARTING:pb::MEASUREMENT_STATE_STOPPING):measurement_fault_?pb::MEASUREMENT_STATE_ERROR:collecting_?pb::MEASUREMENT_STATE_COLLECTING:pb::MEASUREMENT_STATE_STOPPED);
-        client_.send(e);
+        client_.send(e);laser_status();
         if(options_.role=="eff"){
             pb::Envelope p;auto* r=p.mutable_pointing_status();r->set_device_id(options_.id);if(!control_.empty())r->set_control_session_id(control_);r->set_control_epoch(epoch_);r->set_last_accepted_sequence(sequence_);r->set_motion_state(motion_state());
             fill_angles(r->mutable_angles(),motor_.sample());if(motor_.sample().pan_valid){r->set_pan_deg(motor_.sample().pan);r->set_pan_measured(true);}if(motor_.sample().tilt_valid){r->set_tilt_deg(motor_.sample().tilt);r->set_tilt_measured(true);}
@@ -153,6 +221,7 @@ class Application {
         const bool has_pan=obs?q.has_pan_deg():p.has_pan_deg(),has_tilt=obs?q.has_tilt_deg():p.has_tilt_deg();
         if(!point&&(has_pan||has_tilt||(obs?q.has_purpose()||q.has_collection_session_id()||q.has_object_id()||q.has_source_frame_id():p.has_collection_session_id()||p.has_object_id()||p.has_source_frame_id()))){client_.reject(e,pb::REASON_CODE_INVALID_MESSAGE);return;}
         if(point){
+            if(laser_.estop_latched()){client_.reject(e,pb::REASON_CODE_ESTOP_LATCHED);return;}
             const auto rev=obs?q.installation_revision():p.effector_installation_revision();const auto pan=obs?q.pan_deg():p.pan_deg(),tilt=obs?q.tilt_deg():p.tilt_deg();
             if(!installation_||rev!=installation_){client_.reject(e,pb::REASON_CODE_INSTALLATION_MISMATCH);return;}
             if(!(obs?obs_gate_:gate_) || (obs&&(collecting_||measurement_.valid()))){client_.reject(e,pb::REASON_CODE_BUSY);return;}
@@ -170,11 +239,12 @@ class Application {
             if(!obs){last_point_request_=p.request_id();last_point_epoch_=p.control_epoch();last_point_sequence_=p.command_sequence();}
             std::cout<<"POINT "<<options_.id<<' '<<seq<<' '<<pan<<' '<<tilt<<'\n'<<std::flush;
         }else if(stop){
+            laser_off();
             cancel_motion();high=seq;gate_=obs_gate_=false;settled_=false;stable_since_={};++pose_generation_;pending_frame_.reset();
             if(!motor_.hold()){client_.reject(e,pb::REASON_CODE_ANGLE_READ_FAILED);return;}
             motion_=Motion{e,motor_.sample().pan,motor_.sample().tilt,Mono::now(),{},motor_.sample().sequence,true};finish_motion(e,pb::REQUEST_RESULT_ACCEPTED);
             std::cout<<"STOP "<<options_.id<<' '<<seq<<'\n'<<std::flush;
-        }else if(drain){high=seq;(obs?obs_gate_:gate_)=false;if(motion_){drain_=e;finish_motion(e,pb::REQUEST_RESULT_ACCEPTED);}else finish_motion(e,pb::REQUEST_RESULT_COMPLETED);}
+        }else if(drain){laser_off();high=seq;(obs?obs_gate_:gate_)=false;if(motion_){drain_=e;finish_motion(e,pb::REQUEST_RESULT_ACCEPTED);}else finish_motion(e,pb::REQUEST_RESULT_COMPLETED);}
         else{high=seq;finish_motion(e,pb::REQUEST_RESULT_COMPLETED);status();}
     }
     void command(const pb::Envelope& e){
@@ -183,15 +253,17 @@ class Application {
             if(!stopped()||collecting_||measurement_.valid()){client_.reject(e,pb::REASON_CODE_BUSY);return;}
             if(q.device_id()!=options_.id||!q.installation_revision()||q.axis_calibration_id()!=motor_.calibration().id||q.mount_rotation_size()!=9){client_.reject(e,pb::REASON_CODE_INSTALLATION_MISMATCH);return;}
             for(double v:q.mount_rotation())if(!std::isfinite(v)){client_.reject(e,pb::REASON_CODE_INVALID_ARGUMENT);return;}
-            installation_=q.installation_revision();pb::Envelope out;auto* r=out.mutable_installation_result();result(r->mutable_outcome(),q.request_id(),pb::REQUEST_RESULT_COMPLETED);r->set_device_id(options_.id);r->set_active_installation_revision(installation_);client_.send(out,q.request_id());status();
+            laser_off();installation_=q.installation_revision();pb::Envelope out;auto* r=out.mutable_installation_result();result(r->mutable_outcome(),q.request_id(),pb::REQUEST_RESULT_COMPLETED);r->set_device_id(options_.id);r->set_active_installation_revision(installation_);client_.send(out,q.request_id());status();
         }else if(e.has_control_open()&&options_.role=="eff"){
+            if(laser_.estop_latched()){client_.reject(e,pb::REASON_CODE_ESTOP_LATCHED);return;}
             const auto& q=e.control_open();if(!stopped()){client_.reject(e,pb::REASON_CODE_BUSY);return;}
             if(!installation_||q.installation_revision()!=installation_){client_.reject(e,pb::REASON_CODE_INSTALLATION_MISMATCH);return;}
             if(q.control_epoch()<=epoch_||q.control_session_id().size()!=36||(q.mode()!=pb::CONTROL_MODE_AUTO&&q.mode()!=pb::CONTROL_MODE_MANUAL)){client_.reject(e,pb::REASON_CODE_STALE_COMMAND);return;}
-            control_=q.control_session_id();epoch_=q.control_epoch();sequence_=0;gate_=true;control_mode_=q.mode();
+            laser_off();control_=q.control_session_id();epoch_=q.control_epoch();sequence_=laser_sequence_=0;gate_=true;control_mode_=q.mode();
             last_point_request_.clear();last_point_epoch_=last_point_sequence_=0;
             pb::Envelope out;auto* r=out.mutable_control_result();result(r->mutable_outcome(),q.request_id(),pb::REQUEST_RESULT_COMPLETED);r->set_active_control_session_id(control_);r->set_control_epoch(epoch_);client_.send(out,q.request_id());
-        }else if(e.has_pointing_command()||e.has_obs_motion_command())motion_command(e);
+        }else if(e.has_laser_command())laser_command(e);
+        else if(e.has_pointing_command()||e.has_obs_motion_command())motion_command(e);
         else if(e.has_obs_mode_command()&&sensor_){
             const auto& q=e.obs_mode_command();if(!stopped()||collecting_||measurement_.valid()){client_.reject(e,pb::REASON_CODE_BUSY);return;}
             if(q.mode()!=pb::OBSERVATION_MODE_FIXED_VIEW||q.has_follow_profile()){client_.reject(e,pb::REASON_CODE_MODE_UNSUPPORTED);return;}
@@ -215,12 +287,20 @@ class Application {
         }else client_.reject(e,pb::REASON_CODE_UNSUPPORTED_TYPE);
     }
     void progress(){
+        if(laser_.estop_latched()){
+            if(laser_deadline_||laser_.read()!=pb::LASER_STATE_OFF)laser_off();
+            if(gate_){gate_=false;cancel_motion();motor_.hold();settled_=false;stable_since_={};}
+        }
+        if(laser_.supported() && ((laser_deadline_&&Mono::now()>=*laser_deadline_) ||
+            ((!laser_deadline_||!gate_||!options_.clock_verified)&&laser_.read()!=pb::LASER_STATE_OFF)))laser_off();
         const double current_wall=wall();const auto current_mono=Mono::now();
         if(std::abs((current_wall-last_wall_)-std::chrono::duration<double>(current_mono-last_mono_).count())>.25){
-            pose_history_.clear();pending_frame_.reset();options_.acquisition.reset();options_.clock_verified=false;
+            pose_history_.clear();pending_frame_.reset();options_.acquisition.reset();options_.clock_verified=false;laser_off();
         }
         last_wall_=current_wall;last_mono_=current_mono;
         const bool fresh=motor_.poll();
+        if(laser_.supported()&&(!motor_.sample().pan_valid||!motor_.sample().tilt_valid))laser_off();
+        if(laser_deadline_&&(Mono::now()>=*laser_deadline_||laser_.read()!=pb::LASER_STATE_ON))laser_off();
         if(fresh){const auto& s=motor_.sample();const auto now=Mono::now();
             if(s.pan_valid&&s.tilt_valid&&previous_sample_.pan_valid&&previous_sample_.tilt_valid&&s.pan_at-previous_sample_.pan_at<=.25&&s.tilt_at-previous_sample_.tilt_at<=.25&&std::abs(s.pan-previous_sample_.pan)<=options_.tolerance_deg&&std::abs(s.tilt-previous_sample_.tilt)<=options_.tolerance_deg){
                 if(stable_since_==Mono::time_point{} || std::abs(s.pan-stable_sample_.pan)>options_.tolerance_deg || std::abs(s.tilt-stable_sample_.tilt)>options_.tolerance_deg){
@@ -234,7 +314,7 @@ class Application {
             const auto& s=motor_.sample();const auto now=Mono::now();
             if(!s.pan_valid||!s.tilt_valid||now-motion_->started>std::chrono::milliseconds(motion_->stopping?options_.stop_timeout_ms:options_.point_timeout_ms)){
                 const auto reason=!s.pan_valid||!s.tilt_valid?pb::REASON_CODE_ANGLE_READ_FAILED:pb::REASON_CODE_COMPLETION_TIMEOUT;
-                auto q=motion_->request;motion_.reset();settled_=false;stable_since_={};motor_.hold();gate_=obs_gate_=false;finish_motion(q,pb::REQUEST_RESULT_FAILED,reason);
+                auto q=motion_->request;motion_.reset();settled_=false;stable_since_={};motor_.hold();gate_=obs_gate_=false;laser_off();finish_motion(q,pb::REQUEST_RESULT_FAILED,reason);
             }else if(s.sequence>motion_->initial_sample&&std::abs(s.pan-motion_->pan)<=options_.tolerance_deg&&std::abs(s.tilt-motion_->tilt)<=options_.tolerance_deg){
                 if(motion_->near_since==Mono::time_point{})motion_->near_since=now;
                 if(settled_&&now-motion_->near_since>=std::chrono::milliseconds(options_.settle_ms)){auto q=motion_->request;motion_.reset();finish_motion(q,pb::REQUEST_RESULT_COMPLETED);status();}
@@ -279,16 +359,16 @@ class Application {
         for(std::size_t i=0;i<chunks.size();++i){if(!collecting_||collection_!=collection||client_.session()!=session)return;chunks[i].set_chunk_count(static_cast<std::uint32_t>(chunks.size()));chunks[i].set_chunk_index(static_cast<std::uint32_t>(i));pb::Envelope e;e.mutable_point_cloud_chunk()->CopyFrom(chunks[i]);client_.send(e);if(i%128==127)client_.step();}
     }
 public:
-    explicit Application(Options o,device::CaptureFactory factory):options_(std::move(o)),motor_(options_.simulation,options_.axes,options_.uart,options_.baud),sensor_(factory?factory(options_.simulation,options_.sensor):nullptr),client_({options_.id,options_.c2,options_.role=="obs"?pb::ROLE_OBS:pb::ROLE_EFF,options_.port,options_.c2_port}){
+    explicit Application(Options o,device::CaptureFactory factory):options_(std::move(o)),motor_(options_.simulation,options_.axes,options_.uart,options_.baud),sensor_(factory?factory(options_.simulation,options_.sensor):nullptr),laser_(options_.simulation,options_.role=="eff",options_.laser_chip,options_.laser_line,options_.laser_estop_line),client_({options_.id,options_.c2,options_.role=="obs"?pb::ROLE_OBS:pb::ROLE_EFF,options_.port,options_.c2_port,laser_.supported()}){
         motor_.poll();
         client_.command=[this](const auto& e){command(e);};
-        client_.connected=[this](bool changed){if(changed){installation_=mode_revision_=0;control_.clear();obs_control_.clear();epoch_=sequence_=obs_epoch_=obs_sequence_=frame_=0;}capabilities();status();std::cout<<"REGISTERED "<<options_.id<<" boot="<<client_.boot<<" session="<<client_.session()<<'\n'<<std::flush;};
-        client_.disconnected=[this]{++pose_generation_;pose_history_.clear();pending_frame_.reset();motor_.hold();settled_=false;stable_since_={};motion_.reset();drain_.reset();gate_=obs_gate_=false;collecting_=false;measurement_request_.reset();disconnect_stop_=bool(sensor_);};
+        client_.connected=[this](bool changed){if(changed){laser_off();installation_=mode_revision_=0;control_.clear();obs_control_.clear();epoch_=sequence_=laser_sequence_=obs_epoch_=obs_sequence_=frame_=0;}capabilities();status();std::cout<<"REGISTERED "<<options_.id<<" boot="<<client_.boot<<" session="<<client_.session()<<'\n'<<std::flush;};
+        client_.disconnected=[this]{laser_off();++pose_generation_;pose_history_.clear();pending_frame_.reset();motor_.hold();settled_=false;stable_since_={};motion_.reset();drain_.reset();gate_=obs_gate_=false;collecting_=false;measurement_request_.reset();disconnect_stop_=bool(sensor_);};
     }
     ~Application(){shutdown();}
     void shutdown()noexcept{
         if(shutdown_)return;shutdown_=true;
-        try{motor_.hold();collecting_=false;if(measurement_.valid())measurement_.wait();if(sensor_)sensor_->stop();}catch(const std::exception&){}
+        try{laser_off();motor_.hold();collecting_=false;if(measurement_.valid())measurement_.wait();if(sensor_)sensor_->stop();}catch(const std::exception&){}
     }
     void run(){
         while(running){client_.step();progress();if(client_.ready()){

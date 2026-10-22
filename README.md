@@ -7,7 +7,8 @@ EFF 프로그램 `mfs_eff`는 공통 라이브러리를, OBS 프로그램 `mfs_o
 각 보드에서는 프로그램 하나만 실행해 UART를 단독으로 소유합니다. 공통부는 독립 라이브러리이며
 별도 상주 프로세스가 아니므로 보드 내부 IPC나 새로운 통신 규격이 필요하지 않습니다.
 기존 `motor/motor-demo` 문자열 UDP 프로그램과 TCP 뷰어용 `live_sender.cpp`는 별도 legacy 실행 경로입니다.
-새 런타임은 레이저 점등/출력 명령을 제공하지 않습니다.
+EFF는 선택적으로 공용 `LaserCommand` ON/OFF/GET_STATUS와 `LaserResult`/`LaserStatus`를 제공합니다.
+시뮬레이션 EFF는 지원을 알리며, 실물은 GPIO 출력·비상입력 설정이 있는 경우에만 활성화됩니다.
 
 ## 포함된 기능
 
@@ -32,7 +33,7 @@ firmware/
   icd/runtime.cpp         공용 UDP/Protobuf 수신·OBS/EFF 제어
   icd/motor.hpp           공통 터렛 제어·각도 보정·실측 피드백
   motor/                 기존 UART 드라이버 재사용 (timeout·checksum·읽기 유효성 보완)
-  external/warwarden-protocol/  공용 proto, 935fc4f 고정
+  external/warwarden-protocol/  공용 proto, Git submodule 커밋 고정
   external/LiDAR/capture/       SDK 원본 취득과 시뮬레이션 backend
 ```
 
@@ -95,6 +96,19 @@ C2 CLI의 `obs point PAN TILT`, `obs stop`, `obs status`로 조작합니다.
 자동 지향은 측정된 OBS pan/tilt=0의 고정 관측만 허용합니다.
 
 ## 실물 설정
+
+교육용 저출력 레이저는 EFF에만 `--laser-gpiochip /dev/gpiochipN --laser-line N --laser-estop-line M`으로
+명시합니다. 같은 chip의 출력-enable active-high와 비상입력 active-high line을 사용하며 offset은 달라야 합니다.
+설정이 없으면 GPIO를 열지 않고 레이저 지원을 알리지 않습니다. OBS는 이 옵션을 거부합니다.
+출력은 시작 OFF, 최대 5000ms이며 GPIO line을 읽어 enable 상태를 확인합니다. 광출력 센서 측정값은 아닙니다.
+비상 입력 또는 입력 읽기 오류는 소등·래치 후 ON/이동을 차단합니다. 해제는 재시작 전 제공하지 않습니다.
+시간 만료·STOP/DRAIN·설치/제어/접속 세션 교체·접속 상실·시각 변경·모터 피드백 오류·정상 종료 때 소등합니다.
+실물 배선·광출력·비상입력·강제 종료/전원 차단 시 GPIO 상태는 별도 보드 검증이 필요합니다.
+C2에서 `point 201 0 0` 완료 후 `laser on 201 1000`, `laser off 201`, `laser status 201`을 사용합니다.
+레이저 순번은 지향 순번과 독립적이며 중복 요청은 출력을 다시 켜거나 시간을 연장하지 않습니다.
+
+`tests/test_laser.py --eff build/mfs_eff --obs build/mfs_obs`로 장치 시뮬레이션 시험을 실행합니다.
+`--console C2_EXECUTABLE --config C2_CONFIG`를 추가하면 실제 C++ 통제소 CLI까지 연결합니다.
 
 실물 모드에는 기본 축 보정값을 넣지 않습니다. 다음 값을 실제 확인해 명시해야 합니다.
 

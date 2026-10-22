@@ -67,7 +67,7 @@ inline void result(pb::Result* out,const std::string& request,pb::RequestResult 
 
 class Client {
 public:
-    struct Config { std::string id,c2_ip;pb::Role role;unsigned short listen_port=0,c2_port=5000; };
+    struct Config { std::string id,c2_ip;pb::Role role;unsigned short listen_port=0,c2_port=5000;bool laser=false; };
     std::function<void(const pb::Envelope&)> command;
     std::function<void(bool)> connected; // true only when connectionSessionId changes
     std::function<void()> disconnected;
@@ -111,6 +111,7 @@ public:
     void reject(const pb::Envelope& request,pb::ReasonCode reason) {
         pb::Envelope e;pb::Result* out=nullptr;std::string id;
         switch(request.body_case()) {
+        case pb::Envelope::kLaserCommand: {const auto& q=request.laser_command();id=q.request_id();auto* r=e.mutable_laser_result();r->set_control_session_id(q.control_session_id());r->set_control_epoch(q.control_epoch());r->set_command_sequence(q.command_sequence());r->set_actual_laser_state(pb::LASER_STATE_UNKNOWN);out=r->mutable_outcome();break;}
         case pb::Envelope::kInstallationSet: {const auto& q=request.installation_set();id=q.request_id();auto* r=e.mutable_installation_result();r->set_device_id(config_.id);out=r->mutable_outcome();break;}
         case pb::Envelope::kControlOpen: {const auto& q=request.control_open();id=q.request_id();auto* r=e.mutable_control_result();r->set_active_control_session_id(q.control_session_id());r->set_control_epoch(q.control_epoch());out=r->mutable_outcome();break;}
         case pb::Envelope::kPointingCommand: {const auto& q=request.pointing_command();id=q.request_id();auto* r=e.mutable_pointing_result();r->set_control_session_id(q.control_session_id());r->set_control_epoch(q.control_epoch());r->set_command_sequence(q.command_sequence());r->set_actual_motion_state(pb::MOTION_STATE_UNKNOWN);out=r->mutable_outcome();break;}
@@ -128,7 +129,7 @@ public:
             last_register_=now;
             if(registration_packet_.empty()){
                 pb::Envelope e;e.set_version_major(1);e.set_sender_id(config_.id);e.set_recipient_id("C2");e.set_message_id(uuid());e.set_sent_at(utc());
-                auto* r=e.mutable_register_request();r->set_request_id(registration_id_);r->set_device_id(config_.id);r->set_role(config_.role);r->set_boot_id(boot);r->set_receive_port(port_);registration_packet_=e.SerializeAsString();
+                auto* r=e.mutable_register_request();r->set_request_id(registration_id_);r->set_device_id(config_.id);r->set_role(config_.role);r->set_boot_id(boot);r->set_receive_port(port_);if(config_.laser)r->add_capabilities(pb::CAPABILITY_LASER_CONTROL);registration_packet_=e.SerializeAsString();
             }raw_send(registration_packet_);
         }
         if(ready_ && now-last_heartbeat_>=std::chrono::milliseconds(500)){
