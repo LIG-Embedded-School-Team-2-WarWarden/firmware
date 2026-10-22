@@ -36,6 +36,7 @@ struct Controller {
     unsigned long generation = 0;
     unsigned long lastSample = 0;
     int telemetry = -1;
+    string faultReason;
 };
 
 // 아래 세 변수만 두 스레드가 함께 사용한다.
@@ -77,6 +78,20 @@ static bool applyLaser(Controller& controller) {
     controller.laserIsOn = wanted;
     return true;
 }
+static void enterFail(Controller& controller, const string& reason);
+static bool applyLaserOrFail(Controller& controller) {
+    bool wantedOn = controller.fsm.state == State::SHOOT;
+
+    if (applyLaser(controller))
+        return true;
+
+    if (wantedOn)
+        enterFail(controller, "LASER_ON_FAILED");
+    else
+        enterFail(controller, "LASER_OFF_FAILED");
+
+    return false;
+}
 
 static void enqueue(Controller& controller, bool stop, int pan, int tilt) {
     lock_guard<mutex> lock(sharedMutex);
@@ -88,7 +103,7 @@ static void enqueue(Controller& controller, bool stop, int pan, int tilt) {
 static void positionLoop() {
     unsigned long generation = 0, sampleNumber = 0;
     MotorPosition initial = motorReadPositions();
-    motorMove(initial.panTicks, initial.tiltTicks, 200, 200);
+    motorMove(initial.panTicks, initial.tiltTicks, 2000, 2000);
 
     while (true) {
         MotorJob job{};
@@ -104,9 +119,9 @@ static void positionLoop() {
         if (hasJob) {
             if (job.stop) {
                 MotorPosition position = motorReadPositions();
-                motorMove(position.panTicks, position.tiltTicks, 200, 200);
+                motorMove(position.panTicks, position.tiltTicks, 500, 500);
             } else {
-                motorMove(job.pan, job.tilt, 200, 200);
+                motorMove(job.pan, job.tilt, 500, 500);
             }
             generation = job.generation;
         }
@@ -123,13 +138,34 @@ static void positionLoop() {
         this_thread::sleep_for(chrono::milliseconds(50));
     }
 }
+static void enterFail(Controller& controller, const string& reason) {
+    bool firstFailure = controller.fsm.state != State::FAIL;
+
+    controller.fsm.fail();
+    controller.faultReason = reason;
+
+    // 기존 laserIsOn 값과 관계없이 실제 OFF를 시도한다.
+    if (laserOff()) {
+        controller.laserIsOn = false;
+    } else {
+        controller.faultReason += " OFF_RETRY_FAILED";
+    }
+
+    // 같은 실패 때문에 정지 작업을 계속 쌓지 않는다.
+    if (firstFailure)
+        enqueue(controller, true, 0, 0);
+
+    publish(controller, "FAIL " + controller.faultReason);
+}
 
 // 3. 메인 반복문의 각 단계
 static void updateTimerAndLaser(Controller& controller) {
-    controller.fsm.tick(nowMs());
+    // FAIL에서는 자동 복귀나 반복적인 출력 변경을 하지 않는다.
+    if (controller.fsm.state == State::FAIL)
+        return;
 
-    if (!applyLaser(controller))
-        printf("GPIO 출력 변경 실패\n");
+    controller.fsm.tick(nowMs());
+    applyLaserOrFail(controller);
 }
 
 // 새 측정이면 sample에 복사하고 도착 조건을 검사한다.
@@ -162,6 +198,12 @@ static void handleCommand(Controller& controller, const string& message,
     string name, extra;
     input >> name;
 
+    if (controller.fsm.state == State::FAIL &&
+        (name == "MOVE" || name == "on" || name == "ON")) {
+        ethernetReply(sender, "NACK " + name + " FAIL_STATE");
+        return;
+    }
+
     if (name == "HELLO" && !(input >> extra)) {
         setControlAddress(controller, sender);
         publish(controller, string("STATE ") + controller.fsm.name());
@@ -179,7 +221,7 @@ static void handleCommand(Controller& controller, const string& message,
 
     // 목표 위치 범위 검사
     if (pan < 1366 || pan > 2730 ||
-        tilt < 2048 || tilt > 3072) {
+        tilt > 683 || tilt < 0) {
         ethernetReply(
             sender,
             "NACK MOVE " + to_string(id) + " RANGE"
@@ -191,18 +233,43 @@ static void handleCommand(Controller& controller, const string& message,
     controller.sequence = id;
 
     controller.fsm.move(pan, tilt);
-    applyLaser(controller);
+    if (!applyLaserOrFail(controller)) {
+        ethernetReply(
+            sender,
+            "NACK MOVE " + to_string(id) + " GPIO_ERROR"
+        );
+        return;
+    }
     enqueue(controller, false, pan, tilt);
 
     // 작업 큐에 정상적으로 등록한 뒤 접수 응답
     ethernetReply(sender, "ACK MOVE " + to_string(id));
     
-    } else if ((name == "Stop" || name == "STOP" || name == "stop") &&
-               !(input >> extra)) {
-        controller.fsm.stop();
-        applyLaser(controller);
+    } else if (name == "Stop" || name == "STOP" || name == "stop") {
+        if (input >> extra) {
+            ethernetReply(sender, "NACK STOP FORMAT");
+            return;
+        }
+
+        if (!laserOff()) {
+            enterFail(controller, "LASER_OFF_FAILED");
+
+            // 이미 FAIL이었던 경우에도 이번 STOP 요청은 등록한다.
+            enqueue(controller, true, 0, 0);
+
+            ethernetReply(sender, "NACK STOP GPIO_ERROR");
+            return;
+        }
+
+        controller.laserIsOn = false;
+
+        if (controller.fsm.state != State::FAIL)
+            controller.fsm.stop();
+
         enqueue(controller, true, 0, 0);
-    } else if (name == "on" || name == "ON") {
+        ethernetReply(sender, "ACK STOP");
+    }
+    else if (name == "on" || name == "ON") {
         if (input >> extra) {
             ethernetReply(sender, "NACK ON FORMAT");
             return;
@@ -213,7 +280,10 @@ static void handleCommand(Controller& controller, const string& message,
     }
 
     controller.fsm.on(nowMs());
-    applyLaser(controller);
+    if (!applyLaserOrFail(controller)) {
+        ethernetReply(sender, "NACK ON GPIO_ERROR");
+        return;
+    }
 
     ethernetReply(sender, "ACK ON");
     } else if (name == "off" || name == "OFF") {
@@ -224,6 +294,7 @@ static void handleCommand(Controller& controller, const string& message,
 
     // 실제 GPIO OFF 요청
     if (!laserOff()) {
+        enterFail(controller, "LASER_OFF_FAILED");
         ethernetReply(sender, "NACK OFF GPIO_ERROR");
         return;
     }
