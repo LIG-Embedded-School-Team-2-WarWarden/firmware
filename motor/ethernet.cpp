@@ -2,7 +2,6 @@
 #include <sys/socket.h>
 #include <poll.h>
 
-using namespace std;
 static int udp;
 
 void ethernetInit(unsigned short port) {
@@ -14,7 +13,7 @@ void ethernetInit(unsigned short port) {
     bind(udp, reinterpret_cast<sockaddr*>(&local), sizeof(local));
 }
 
-string ethernetReceive(Peer& peer, int timeoutMs) {
+std::string ethernetReceive(Peer& peer, int timeoutMs) {
     pollfd item{udp, POLLIN, 0};
     if (poll(&item, 1, timeoutMs) <= 0) return {};
     // 명령이 도착할 때까지 기다리고, 송신자의 주소도 함께 저장한다.
