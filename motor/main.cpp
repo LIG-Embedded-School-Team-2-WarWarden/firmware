@@ -2,351 +2,154 @@
 #include "laser.h"
 #include "ethernet.h"
 #include "control_fsm.h"
+#include "controller.h"
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
-#include <string>
+#include <iomanip>
 #include <thread>
 #include <mutex>
 #include <deque>
 #include <chrono>
-#include <sys/socket.h>
-
+#include <csignal>
+#include <cctype>
 using namespace std;
 
-struct MotorJob {
-    bool stop;
-    int pan, tilt;
-    unsigned long generation;
-};
-
-struct Sample {
-    MotorPosition position{};
-    unsigned long generation = 0;
-    unsigned long number = 0;
-    long long time = 0;
-};
-
-struct Controller {
-    ControlFsm fsm;
-    Peer control{};
-    bool connected = false;
-    bool laserIsOn = false;
-    unsigned long sequence = 0;
-    unsigned long generation = 0;
-    unsigned long lastSample = 0;
-    int telemetry = -1;
-    string faultReason;
-};
-
-// 아래 세 변수만 두 스레드가 함께 사용한다.
-static mutex sharedMutex;
-static deque<MotorJob> jobs;
-static Sample latest;
-
 static long long nowMs() {
-    return chrono::duration_cast<chrono::milliseconds>(
-        chrono::steady_clock::now().time_since_epoch()).count();
+    return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now().time_since_epoch()).count();
+}
+static volatile sig_atomic_t quitting = 0;
+static void quitHandler(int) { quitting = 1; }
+enum class JobKind { MOVE, SCAN, HOLD, RESET };
+struct Job { JobKind kind; int pan, tilt; uint64_t generation; };
+struct MotorEvent {
+    bool job = false, ok = false;
+    JobKind kind = JobKind::MOVE;
+    uint64_t generation = 0;
+    MotorPosition position;
+    long long time = 0;
+    string error;
+};
+static mutex workMutex;
+static deque<Job> jobs;
+static deque<MotorEvent> events;
+static bool workerQuit = false;
+static void post(const MotorEvent& event) {
+    lock_guard<mutex> lock(workMutex);
+    events.push_back(event);
 }
 
-// 1. 출력 및 모터 작업 등록
-static void publish(const Controller& controller, const string& text) {
-    printf("%s\n", text.c_str());
-    if (controller.connected) {
-        sendto(controller.telemetry, text.data(), text.size(), 0,
-               reinterpret_cast<const sockaddr*>(&controller.control.address),
-               sizeof(controller.control.address));
-    }
-}
-
-static bool applyLaser(Controller& controller) {
-    bool wanted = controller.fsm.state == State::SHOOT;
-
-    if (wanted == controller.laserIsOn)
-        return true;
-
-    bool success;
-
-    if (wanted)
-        success = laserOn();
-    else
-        success = laserOff();
-
-    if (!success)
-        return false;
-
-    controller.laserIsOn = wanted;
-    return true;
-}
-static void enterFail(Controller& controller, const string& reason);
-static bool applyLaserOrFail(Controller& controller) {
-    bool wantedOn = controller.fsm.state == State::SHOOT;
-
-    if (applyLaser(controller))
-        return true;
-
-    if (wantedOn)
-        enterFail(controller, "LASER_ON_FAILED");
-    else
-        enterFail(controller, "LASER_OFF_FAILED");
-
-    return false;
-}
-
-static void enqueue(Controller& controller, bool stop, int pan, int tilt) {
-    lock_guard<mutex> lock(sharedMutex);
-    if (stop) jobs.clear();
-    jobs.push_back(MotorJob{stop, pan, tilt, ++controller.generation});
-} // 함수가 끝나면 잠금이 풀린다.
-
-// 2. 모터 스레드
-static void positionLoop() {
-    unsigned long generation = 0, sampleNumber = 0;
-    MotorPosition initial = motorReadPositions();
-    motorMove(initial.panTicks, initial.tiltTicks, 2000, 2000);
-
+// UART는 이 스레드만 사용한다. 모든 읽기/쓰기는 유한한 시간 안에 반환한다.
+static void motorLoop(string device) {
+    bool healthy = false;
+    int previousPan = 0, previousTilt = 0;
+    bool haveTarget = false;
+    uint64_t generation = 0;
     while (true) {
-        MotorJob job{};
-        bool hasJob;
+        Job job{};
+        bool have;
         {
-            lock_guard<mutex> lock(sharedMutex);
-            hasJob = !jobs.empty();
-            if (hasJob) {
-                job = jobs.front();
-                jobs.pop_front();
-            }
+            lock_guard<mutex> lock(workMutex);
+            if (workerQuit) break;
+            have = !jobs.empty();
+            if (have) { job = jobs.front(); jobs.pop_front(); }
         }
-        if (hasJob) {
-            if (job.stop) {
-                MotorPosition position = motorReadPositions();
-                motorMove(position.panTicks, position.tiltTicks, 500, 500);
-            } else {
-                motorMove(job.pan, job.tilt, 500, 500);
+        if (have) {
+            MotorEvent result;
+            result.job = true; result.kind = job.kind; result.generation = job.generation;
+            bool ok = true;
+            if (job.kind == JobKind::RESET)
+                ok = motorInit(device.c_str(), 115200, result.error);
+            if (ok && job.kind != JobKind::MOVE && job.kind != JobKind::SCAN) {
+                ok = motorReadPositions(result.position, result.error);
+                if (ok && job.kind == JobKind::RESET &&
+                    !ControlFsm::measurementInRange(result.position.panTicks, result.position.tiltTicks)) {
+                    result.error = ControlFsm::rangeError(result.position.panTicks,result.position.tiltTicks); ok = false;
+                }
+                if (ok) ok = motorMove(ControlFsm::clampPan(result.position.panTicks), ControlFsm::clampTilt(result.position.tiltTicks),
+                                       ControlFsm::SPEED, ControlFsm::SPEED, result.error);
+                if (ok) { previousPan = ControlFsm::clampPan(result.position.panTicks); previousTilt = ControlFsm::clampTilt(result.position.tiltTicks); haveTarget = true; }
+            } else if (ok) {
+                // Decide from a fresh UART sample, independently for each axis.
+                ok = motorReadPositions(result.position, result.error);
+                if (ok && !ControlFsm::measurementInRange(result.position.panTicks, result.position.tiltTicks)) {
+                    result.error = ControlFsm::rangeError(result.position.panTicks,result.position.tiltTicks); ok = false;
+                }
+                if (ok) {
+                    // Raster row changes are only two ticks; never suppress them as deadband.
+                    bool sendPan = job.kind == JobKind::SCAN || abs(result.position.panTicks-job.pan) > ControlFsm::TOLERANCE ||
+                        (haveTarget && abs(previousPan-job.pan) > ControlFsm::TOLERANCE);
+                    bool sendTilt = job.kind == JobKind::SCAN || abs(result.position.tiltTicks-job.tilt) > ControlFsm::TOLERANCE ||
+                        (haveTarget && abs(previousTilt-job.tilt) > ControlFsm::TOLERANCE);
+                    ok = motorMoveSelected(job.pan, job.tilt, ControlFsm::SPEED, sendPan, sendTilt, result.error);
+                    if (ok) {
+                        if (sendPan) previousPan = job.pan;
+                        if (sendTilt) previousTilt = job.tilt;
+                    }
+                }
             }
-            generation = job.generation;
+            result.ok = ok; result.time = nowMs();
+            healthy = ok; generation = job.generation;
+            post(result);
         }
-
-        Sample sample;
-        sample.position = motorReadPositions();
-        sample.generation = generation;
-        sample.number = ++sampleNumber;
-        sample.time = nowMs();
-        {
-            lock_guard<mutex> lock(sharedMutex);
-            latest = sample;
+        if (healthy) {
+            MotorEvent sample;
+            sample.generation = generation;
+            sample.ok = motorReadPositions(sample.position, sample.error);
+            sample.time = nowMs();
+            healthy = sample.ok;
+            post(sample);
         }
         this_thread::sleep_for(chrono::milliseconds(50));
     }
-}
-static void enterFail(Controller& controller, const string& reason) {
-    bool firstFailure = controller.fsm.state != State::FAIL;
-
-    controller.fsm.fail();
-    controller.faultReason = reason;
-
-    // 기존 laserIsOn 값과 관계없이 실제 OFF를 시도한다.
-    if (laserOff()) {
-        controller.laserIsOn = false;
-    } else {
-        controller.faultReason += " OFF_RETRY_FAILED";
-    }
-
-    // 같은 실패 때문에 정지 작업을 계속 쌓지 않는다.
-    if (firstFailure)
-        enqueue(controller, true, 0, 0);
-
-    publish(controller, "FAIL " + controller.faultReason);
+    // 정상 종료 시에도 가능한 경우 현재 위치 유지 명령을 한 번 시도한다.
+    MotorPosition p;
+    string error;
+    if (healthy && (!motorReadPositions(p, error) ||
+        !motorMove(ControlFsm::clampPan(p.panTicks), ControlFsm::clampTilt(p.tiltTicks), ControlFsm::SPEED, ControlFsm::SPEED, error)))
+        fprintf(stderr, "Shutdown hold failed: %s\n", error.c_str());
 }
 
-// 3. 메인 반복문의 각 단계
-static void updateTimerAndLaser(Controller& controller) {
-    // FAIL에서는 자동 복귀나 반복적인 출력 변경을 하지 않는다.
-    if (controller.fsm.state == State::FAIL)
-        return;
-
-    controller.fsm.tick(nowMs());
-    applyLaserOrFail(controller);
-}
-
-// 새 측정이면 sample에 복사하고 도착 조건을 검사한다.
-static bool processLatestSample(Controller& controller, Sample& sample) {
-    {
-        lock_guard<mutex> lock(sharedMutex);
-        sample = latest;
+int main(int argc,char** argv) {
+    if(argc<3 || argc>4) {
+        fprintf(stderr,"Usage: %s UART_DEVICE GPIOCHIP [UDP_PORT=2000]\n",argv[0]); return 1;
     }
-    if (sample.number == controller.lastSample) return false;
-    controller.lastSample = sample.number;
-
-    if (sample.generation == controller.generation &&
-        nowMs() - sample.time <= ControlFsm::SAMPLE_GAP_MS) {
-        controller.fsm.sample(sample.position.panTicks,
-                              sample.position.tiltTicks, sample.time);
-    }
-    return true;
-}
-
-static void setControlAddress(Controller& controller, const Peer& sender) {
-    controller.control = sender;
-    controller.control.address.sin_port = htons(5002);
-    controller.connected = true;
-}
-
-// 받은 문자열을 해석해 FSM/레이저/작업 큐에 반영한다.
-static void handleCommand(Controller& controller, const string& message,
-                          const Peer& sender) {
-    istringstream input(message);
-    string name, extra;
-    input >> name;
-
-    if (controller.fsm.state == State::FAIL &&
-        (name == "MOVE" || name == "on" || name == "ON")) {
-        ethernetReply(sender, "NACK " + name + " FAIL_STATE");
-        return;
-    }
-
-    if (name == "HELLO" && !(input >> extra)) {
-        setControlAddress(controller, sender);
-        publish(controller, string("STATE ") + controller.fsm.name());
-
-} else if (name == "MOVE") {
-    unsigned long id;
-    int pan, tilt, panSpeed, tiltSpeed;
-
-    // 필요한 숫자 다섯 개가 있고, 추가 단어는 없는지 검사
-    if (!(input >> id >> pan >> tilt >> panSpeed >> tiltSpeed)
-        || (input >> extra)) {
-        ethernetReply(sender, "NACK MOVE FORMAT");
-        return;
-    }
-
-    // 목표 위치 범위 검사
-    if (pan < 1366 || pan > 2730 ||
-        tilt > 683 || tilt < 0) {
-        ethernetReply(
-            sender,
-            "NACK MOVE " + to_string(id) + " RANGE"
-        );
-        return;
-    }
-
-    setControlAddress(controller, sender);
-    controller.sequence = id;
-
-    controller.fsm.move(pan, tilt);
-    if (!applyLaserOrFail(controller)) {
-        ethernetReply(
-            sender,
-            "NACK MOVE " + to_string(id) + " GPIO_ERROR"
-        );
-        return;
-    }
-    enqueue(controller, false, pan, tilt);
-
-    // 작업 큐에 정상적으로 등록한 뒤 접수 응답
-    ethernetReply(sender, "ACK MOVE " + to_string(id));
-    
-    } else if (name == "Stop" || name == "STOP" || name == "stop") {
-        if (input >> extra) {
-            ethernetReply(sender, "NACK STOP FORMAT");
-            return;
+    int port=argc==4?atoi(argv[3]):2000;
+    if(port<1 || port>65535 || !ethernetInit(static_cast<unsigned short>(port))) return 1;
+    signal(SIGINT,quitHandler); signal(SIGTERM,quitHandler);
+    icd::Controller app;
+    uint64_t generation=0;
+    auto queue=[&](JobKind kind,int p,int t) {
+        lock_guard<mutex> lock(workMutex);
+        jobs.clear(); jobs.push_back(Job{kind,p,t,++generation});
+    };
+    app.move=[&](int p,int t) { queue(JobKind::MOVE,p,t); };
+    app.scanMove=[&](int p,int t) { queue(JobKind::SCAN,p,t); };
+    app.hold=[&]() { queue(JobKind::HOLD,0,0); };
+    app.light=[](bool on) { return on?laserOn():laserOff(); };
+    if(!laserInit(argv[2],0)) app.fail();
+    else queue(JobKind::RESET,0,0);
+    thread worker(motorLoop,string(argv[1]));
+    while(!quitting) {
+        deque<MotorEvent> received;
+        { lock_guard<mutex> lock(workMutex); received.swap(events); }
+        for(const auto& e:received) {
+            if(e.generation!=generation) continue;
+            if(!e.ok) { fprintf(stderr,"Motor error: %s\n",e.error.c_str()); app.fail(); }
+            else if(!e.job || e.kind==JobKind::RESET) app.sample(e.position.panTicks,e.position.tiltTicks,e.time);
         }
-
-        if (!laserOff()) {
-            enterFail(controller, "LASER_OFF_FAILED");
-
-            // 이미 FAIL이었던 경우에도 이번 STOP 요청은 등록한다.
-            enqueue(controller, true, 0, 0);
-
-            ethernetReply(sender, "NACK STOP GPIO_ERROR");
-            return;
+        app.tick(nowMs());
+        Peer peer;
+        string bytes=ethernetReceive(peer,10);
+        if(!bytes.empty()) {
+            string identity=to_string(ntohl(peer.address.sin_addr.s_addr))+":"+to_string(ntohs(peer.address.sin_port));
+            string response=app.receive(bytes,identity,nowMs());
+            if(!response.empty() && !ethernetReply(peer,response)) fprintf(stderr,"UDP reply failed\n");
         }
-
-        controller.laserIsOn = false;
-
-        if (controller.fsm.state != State::FAIL)
-            controller.fsm.stop();
-
-        enqueue(controller, true, 0, 0);
-        ethernetReply(sender, "ACK STOP");
     }
-    else if (name == "on" || name == "ON") {
-        if (input >> extra) {
-            ethernetReply(sender, "NACK ON FORMAT");
-            return;
-        }
-    if (controller.fsm.state != State::READY) {
-        ethernetReply(sender, "NACK ON NOT_READY");
-        return;
-    }
-
-    controller.fsm.on(nowMs());
-    if (!applyLaserOrFail(controller)) {
-        ethernetReply(sender, "NACK ON GPIO_ERROR");
-        return;
-    }
-
-    ethernetReply(sender, "ACK ON");
-    } else if (name == "off" || name == "OFF") {
-    if (input >> extra) {
-        ethernetReply(sender, "NACK OFF FORMAT");
-        return;
-    }
-
-    // 실제 GPIO OFF 요청
-    if (!laserOff()) {
-        enterFail(controller, "LASER_OFF_FAILED");
-        ethernetReply(sender, "NACK OFF GPIO_ERROR");
-        return;
-    }
-
-    // OFF 호출이 성공한 뒤 내부 상태 변경
-    controller.laserIsOn = false;
-    controller.fsm.off();
-
-    ethernetReply(sender, "ACK OFF");
-}
-}
-static void receiveAndHandleCommand(Controller& controller) {
-    Peer sender{};
-    string message = ethernetReceive(sender, 10);
-    handleCommand(controller, message, sender);
+    if(!laserOff()) fprintf(stderr,"Laser OFF failed at shutdown\n");
+    { lock_guard<mutex> lock(workMutex); workerQuit=true; }
+    worker.join(); return 0;
 }
 
-static void publishUpdates(const Controller& controller, State before,
-                           bool fresh, const Sample& sample) {
-    if (before != controller.fsm.state)
-        publish(controller, string("STATE ") + controller.fsm.name());
 
-    if (fresh) {
-        publish(controller, "POS " + to_string(controller.sequence) + " " +
-                to_string(sample.position.panTicks) + " " +
-                to_string(sample.position.tiltTicks) + " " +
-                controller.fsm.name() + " GEN " + to_string(sample.generation));
-    }
-}
-
-int main(int argc, char** argv) {
-    const unsigned int line = 0, baud = 115200;
-    unsigned short port = argc > 3 ? atoi(argv[3]) : 5001;
-    laserInit(argv[2], line);
-    motorInit(argv[1], baud);
-    ethernetInit(port);
-    setvbuf(stdout, nullptr, _IOLBF, 0);
-
-    Controller controller;
-    controller.telemetry = socket(AF_INET, SOCK_DGRAM, 0);
-    thread positionThread(positionLoop);
-    publish(controller, "STATE IDLE");
-
-    while (true) {
-        State before = controller.fsm.state;
-        updateTimerAndLaser(controller);
-
-        Sample sample;
-        bool fresh = processLatestSample(controller, sample);
-        receiveAndHandleCommand(controller);
-
-        updateTimerAndLaser(controller);
-        publishUpdates(controller, before, fresh, sample);
-    }
-}
