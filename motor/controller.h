@@ -95,7 +95,7 @@ struct Controller {
         tick(now);
         // Unknown IDs / incomplete headers are dropped, since no response mapping exists.
         if(bytes.size()<6) return {};
-        int id=signedWord(bytes,0);
+        unsigned id=word(bytes,0);
         unsigned seq=word(bytes,2);
         if(responseId(id)==0) return {};
         // FE02 has no result field: malformed status requests are dropped.
