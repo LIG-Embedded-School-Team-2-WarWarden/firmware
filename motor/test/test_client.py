@@ -8,23 +8,28 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from client import (Client, encode, decode, EF01, EF02, EF03, EF04, EF05,
-                        FE01, FE02, FE03, FE04, FE05)
+                        FE01, FE02, FE03, FE04, FE05, make_id, split_id, ECS, FCS, RDR)
 
 
 class CodecTests(unittest.TestCase):
-    def test_signed_ids_unsigned_sequences(self):
+    def test_asset_ids_unsigned_sequences(self):
         for request, response in ((EF01,FE01),(EF02,FE02),(EF03,FE03),(EF04,FE04),(EF05,FE05)):
             fields=(1,30,180) if response==FE02 else (0,1) if response==FE04 else (0,)
             data=encode(response,65535,32768,fields)
-            self.assertEqual(data[:2],(-request).to_bytes(2,'big',signed=True))
+            self.assertEqual(data[:2],response.to_bytes(2,'big'))
             reply=decode(data)
             self.assertEqual((reply['id'],reply['tx'],reply['rx']),(response,65535,32768))
-        self.assertEqual(encode(FE01,1,2,(0,)).hex(),'ffff000100020000')
-        for header in ('0000','8000','0006','fffa','ef01','fe01'):
+        self.assertEqual(encode(FE01,1,2,(0,)).hex(),'fe01000100020000')
+        self.assertEqual(split_id(EF03),(ECS,FCS,3))
+        self.assertEqual(make_id(ECS,RDR,1),0xED01)
+        self.assertEqual(split_id(0xDE01),(RDR,ECS,1))
+        for args in ((16,FCS,1),(ECS,-1,1),(ECS,FCS,256)):
+            with self.assertRaises(ValueError): make_id(*args)
+        for header in ('0000','8000','0001','0002','0003','0004','0005','ffff','fffe','fffd','fffc','fffb','ed01','de01','ef06'):
             with self.assertRaises(ValueError): decode(bytes.fromhex(header+'000100000000'))
 
     def test_golden_and_lengths(self):
-        self.assertEqual(encode(EF03, 1, values=(30, 180)).hex(), '000300010000001e00b40000')
+        self.assertEqual(encode(EF03, 1, values=(30, 180)).hex(), 'ef0300010000001e00b40000')
         for mid, fields, size in ((EF01, (), 8), (EF02, (), 8), (EF03, (30,180), 12),
                                   (EF04, (1,), 8), (EF05, (), 8), (FE01,(0,),8),
                                   (FE02,(1,-1,180),12), (FE03,(0,),8),
@@ -38,7 +43,7 @@ class CodecTests(unittest.TestCase):
 
     def test_invalid_reply(self):
         for bad in (b'', b'\0'*8, encode(FE03,1,values=(99,)),
-                    encode(FE04,1,values=(0,2)), bytes.fromhex('fffc00010000000000010001')):
+                    encode(FE04,1,values=(0,2)), bytes.fromhex('fe0400010000000000010001')):
             with self.assertRaises(ValueError): decode(bad)
 
 
