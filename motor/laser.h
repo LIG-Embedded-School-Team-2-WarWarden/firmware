@@ -1,0 +1,6 @@
+#ifndef DEMO_LASER_H
+#define DEMO_LASER_H
+bool laserInit(const char* gpiochip, unsigned int offset);
+bool laserOn();
+bool laserOff();
+#endif
